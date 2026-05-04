@@ -6,7 +6,14 @@ const chatRoutes = require("./routes/chat"); // ← NEW
 
 const app = express();
 const PORT = process.env.PORT || 5000;
-
+const authRoutes = require("./routes/auth");
+const verifyJWT = require("./middleware/authMiddleware");
+app.get("/protected", verifyJWT, (req, res) => {
+  res.json({
+    message: "You are authenticated",
+    user: req.user,
+  });
+});
 app.get("/", (req, res) => {
   res.send("CCMS Backend is LIVE 🚀");
 });
@@ -20,7 +27,7 @@ app.use(cors({
   credentials: true
 }));
 app.use(express.json({ limit: "20mb" }));
-
+app.use("/auth", authRoutes);
 app.use("/api/judgment", judgmentRoutes);
 app.use("/api/chat", chatRoutes); // ← NEW
 
