@@ -135,17 +135,27 @@ ${trimmedText}
 router.get("/history", verifyJWT, async (req, res) => {
   try {
     const [rows] = await pool.query(
-      `SELECT
-         ps.id,
-         ps.filename,
-         ps.summary_json,
-         ps.created_at,
-         COUNT(ch.id) AS chats
-       FROM pdf_summaries ps
-       LEFT JOIN chat_history ch ON ch.summary_id = ps.id
-       WHERE ps.user_email = ?
-       GROUP BY ps.id
-       ORDER BY ps.created_at DESC`,
+      `SELECT 
+    ps.id,
+    ps.filename,
+    ps.summary_json,
+    ps.created_at,
+    COUNT(ch.id) AS chats
+FROM pdf_summaries ps
+LEFT JOIN chat_history ch 
+    ON ch.summary_id = ps.id
+WHERE ps.id IN (
+    SELECT MAX(id)
+    FROM pdf_summaries
+    WHERE user_email = ?
+    GROUP BY filename
+)
+GROUP BY 
+    ps.id,
+    ps.filename,
+    ps.summary_json,
+    ps.created_at
+ORDER BY ps.created_at DESC;`,
       [req.user.email]
     );
 
