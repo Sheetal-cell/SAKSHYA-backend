@@ -1,14 +1,11 @@
 const express = require("express");
 const OpenAI = require("openai");
-const pdfjsLib = require("pdfjs-dist/legacy/build/pdf");
-
+const pool = require("../db/connection");
+const verifyJWT = require("../middleware/authMiddleware");
 const SYSTEM_PROMPT = require("../middleware/systemPrompt");
 
 const router = express.Router();
 
-// ✅ FIX: Do NOT create the OpenAI client at module load time.
-// process.env values are not yet populated when this file is first require()'d.
-// Instead, create the client lazily inside the route handler.
 function getClient() {
   return new OpenAI({
     apiKey: process.env.OPENROUTER_API_KEY,
@@ -20,91 +17,58 @@ function getClient() {
   });
 }
 
-/**
- * Extract text from PDF using pdfjs
- */
-async function extractTextFromPDF(data) {
-  const loadingTask = pdfjsLib.getDocument({ data });
-  const pdfDoc = await loadingTask.promise;
+const pdfParse = require("pdf-parse");
 
-  let text = "";
-
-  for (let i = 1; i <= pdfDoc.numPages; i++) {
-    const page = await pdfDoc.getPage(i);
-    const content = await page.getTextContent();
-
-    const strings = content.items.map(item => item.str);
-    text += strings.join(" ") + "\n";
-  }
-
-  return text;
+async function extractTextFromPDF(buffer) {
+  const data = await pdfParse(buffer);
+  return data.text;
 }
 
-/**
- * POST /api/judgment/analyze
- */
-router.post("/analyze", async (req, res) => {
+
+router.post("/analyze", verifyJWT, async (req, res) => {
   const { base64, filename } = req.body;
 
   if (!base64) {
-    return res.status(400).json({
-      error: "No PDF data provided. Send base64 field.",
-    });
+    return res.status(400).json({ error: "No PDF data provided." });
   }
 
   if (!process.env.OPENROUTER_API_KEY) {
-    return res.status(500).json({
-      error: "OPENROUTER_API_KEY not configured on server.",
-    });
+    return res.status(500).json({ error: "OPENROUTER_API_KEY not configured." });
   }
 
   try {
-    console.log(`📄 Analyzing judgment: ${filename || "unknown.pdf"}`);
-
-    // Step 1: base64 → Uint8Array
     const buffer = Buffer.from(base64, "base64");
-    const uint8Array = new Uint8Array(buffer);
 
-    // Step 2: Extract text
-    const text = await extractTextFromPDF(uint8Array);
+    const text = await extractTextFromPDF(buffer);
 
     if (!text || text.trim().length < 50) {
       return res.status(400).json({
-        error: "Unable to extract meaningful text from PDF (possibly scanned).",
+        error: "Unable to extract meaningful text (possibly scanned PDF).",
       });
     }
 
-    // Prevent token overflow
     const trimmedText = text.slice(0, 12000);
 
-    // Step 3: Call OpenRouter — client created HERE (env is loaded by now)
     const client = getClient();
 
     const response = await client.chat.completions.create({
       model: "openai/gpt-4o-mini",
       temperature: 0.2,
       messages: [
-        {
-          role: "system",
-          content: SYSTEM_PROMPT,
-        },
+        { role: "system", content: SYSTEM_PROMPT },
         {
           role: "user",
           content: `
-You are a legal analysis engine.
-
 Extract the following from the judgment:
 - Key Directives
-- Action Items (who must do what)
-- Deadlines (explicit or inferred)
+- Action Items
+- Deadlines
 - Compliance Requirements
-- Risk Factors (non-compliance consequences)
+- Risk Factors
 
 Return ONLY valid JSON.
-No explanation.
-No markdown.
 
-Judgment Text:
+Judgment:
 ${trimmedText}
           `,
         },
@@ -113,56 +77,89 @@ ${trimmedText}
 
     const raw = response.choices[0].message.content;
 
-    // Step 4: Clean + Parse JSON safely
-    const clean = raw
-      .replace(/```json/g, "")
-      .replace(/```/g, "")
-      .trim();
+    const clean = raw.replace(/```json/g, "").replace(/```/g, "").trim();
 
     let parsed;
     try {
       parsed = JSON.parse(clean);
     } catch (e) {
-      console.error("⚠️ JSON Parse Failed:", clean);
+      console.error("❌ JSON parse failed:", clean);
       return res.status(502).json({
-        error: "AI returned malformed JSON",
+        error: "AI returned invalid JSON",
         raw_output: clean,
       });
     }
 
-    console.log(`✅ Analysis complete for: ${filename || "unknown.pdf"}`);
+    const [result] = await pool.query(
+      `INSERT INTO pdf_summaries (user_email, filename, summary_json)
+       VALUES (?, ?, ?)`,
+      [req.user.email, filename || "unknown.pdf", JSON.stringify(parsed)]
+    );
+
+    console.log("✅ Saved to DB:", result.insertId);
 
     return res.json({
       success: true,
+      summaryId: result.insertId,
       data: parsed,
     });
 
   } catch (err) {
-    console.error("❌ Analysis error:", err);
+    console.error("❌ Error:", err);
 
     if (err.status === 429) {
       return res.json({
         success: true,
         data: {
-          directives: ["Submit compliance report to authority"],
-          action_items: ["Department to review case file"],
+          directives: ["Submit compliance report"],
+          action_items: ["Review case file"],
           deadlines: ["Within 30 days"],
-          compliance: ["Follow court order strictly"],
-          risks: ["Contempt of court if ignored"],
+          compliance: ["Follow court order"],
+          risks: ["Contempt of court"],
         },
-        note: "Fallback mode (rate limit or quota exceeded)",
+        note: "Fallback (rate limit)",
       });
     }
 
     if (err.status === 401) {
-      return res.status(401).json({
-        error: "Invalid OpenRouter API key.",
-      });
+      return res.status(401).json({ error: "Invalid API key." });
     }
 
     return res.status(500).json({
-      error: err.message || "Failed to analyze judgment.",
+      error: err.message || "Analysis failed",
     });
+  }
+});
+
+// ── GET /api/judgment/history ─────────────────────────────────────────────────
+router.get("/history", verifyJWT, async (req, res) => {
+  try {
+    const [rows] = await pool.query(
+      `SELECT
+         ps.id,
+         ps.filename,
+         ps.summary_json,
+         ps.created_at,
+         COUNT(ch.id) AS chats
+       FROM pdf_summaries ps
+       LEFT JOIN chat_history ch ON ch.summary_id = ps.id
+       WHERE ps.user_email = ?
+       GROUP BY ps.id
+       ORDER BY ps.created_at DESC`,
+      [req.user.email]
+    );
+
+    const parsed = rows.map((r) => ({
+      ...r,
+      summary_json: typeof r.summary_json === "string"
+        ? JSON.parse(r.summary_json)
+        : r.summary_json,
+    }));
+
+    res.json(parsed);
+  } catch (err) {
+    console.error("❌ History error:", err);
+    res.status(500).json({ error: err.message || "Failed to fetch history" });
   }
 });
 
