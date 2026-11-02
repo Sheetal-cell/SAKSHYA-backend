@@ -18,7 +18,8 @@
     "mysql2": "^3.22.3",
     "openai": "^6.34.0",
     "pdf-parse": "^1.1.1",
-    "pdfjs-dist": "^3.4.120"
+    "pdfjs-dist": "^3.4.120",
+    "@qdrant/js-client-rest": "^1.15.0"
   },
   "devDependencies": {
     "nodemon": "^3.0.1"
