@@ -138,3 +138,18 @@ Scalable backend architecture
 Make sure frontend uses:
 
 VITE_API_URL=http://localhost:5000
+
+
+## Judgment RAG (feature/rag-upgrade)
+
+The RAG upgrade stores page-labelled judgment passages and their embedding vectors in the existing MySQL database. Follow-up chat retrieves the five most relevant passages for the selected judgment and asks the existing chat model to answer with page references.
+
+Configure these optional environment variables on the backend deployment:
+
+- `RAG_EMBEDDING_API_KEY`: API key for an OpenAI-compatible embeddings provider. If omitted, the backend attempts to use `OPENROUTER_API_KEY`.
+- `RAG_EMBEDDING_BASE_URL`: embeddings API base URL. Defaults to `https://openrouter.ai/api/v1`.
+- `RAG_EMBEDDING_MODEL`: embedding model identifier. Defaults to `openai/text-embedding-3-small`.
+
+The provider must support the OpenAI-compatible `/embeddings` endpoint and the configured model. Verify that the chosen provider/model supports embeddings before enabling this feature. If embeddings are not configured or indexing fails, the existing structured-analysis chat path remains available.
+
+The `judgment_chunks` table is created automatically the first time indexing is attempted. It is scoped by both judgment ID and authenticated user email; deleting a parent judgment cascades to its chunks.
