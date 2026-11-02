@@ -15,6 +15,7 @@ const pool      = require("../db/connection");
 const verifyJWT = require("../middleware/authMiddleware");
 const SYSTEM_PROMPT = require("../middleware/systemPrompt");
 const pdfParse  = require("pdf-parse");
+const { indexJudgment } = require("../services/rag");
 
 const router = express.Router();
 
@@ -196,10 +197,26 @@ ${trimmedText}
 
     console.log("✅ Saved to DB:", result.insertId);
 
+    // Build the searchable judgment index without making ordinary analysis fail
+    // when the embedding provider is not configured or temporarily unavailable.
+    let rag = { indexed: false, reason: "RAG indexing was not completed." };
+    try {
+      rag = await indexJudgment({
+        summaryId: result.insertId,
+        userEmail: req.user.email,
+        fullText: text,
+      });
+      if (rag.indexed) console.log(`✅ RAG indexed ${rag.chunkCount} judgment chunks.`);
+    } catch (ragError) {
+      console.error("⚠️ RAG indexing failed:", ragError.message);
+      rag = { indexed: false, reason: "Judgment saved, but passage indexing failed." };
+    }
+
     return res.json({
       success: true,
       summaryId: result.insertId,
       data: parsed,
+      rag,
     });
 
   } catch (err) {
