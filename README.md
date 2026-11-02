@@ -6,7 +6,7 @@ SAKSHYA is a legal judgment intelligence system. This repository contains the No
 
 ## Architecture
 
-The backend acts as the application and data layer between the React frontend, AI services, and MySQL.
+The backend acts as the application and data layer between the React frontend, AI services, Qdrant Cloud, and (for account features) MySQL.
 
 ```text
 React + Vite Frontend
@@ -33,17 +33,21 @@ Express API (server.js)
         +-- /api/voice
         |
         v
-  OpenRouter API                 MySQL (mysql2/promise)
-  - Chat completions             - users
-  - Embeddings (RAG)              - pdf_summaries
+  OpenRouter API                 Qdrant Cloud
+  - Chat completions             - judgment_chunks collection
+  - Embeddings (RAG)              - vectors + page-aware payloads
+
+                                  MySQL (authenticated account features)
+                                  - users
+                                  - pdf_summaries
                                   - chat_history
-                                  - judgment_chunks
 ```
 
 ## Technology stack
 
 - Node.js and Express 4
-- MySQL 8-compatible database access through `mysql2/promise`
+- Qdrant Cloud vector storage through its REST API
+- MySQL 8-compatible account/history database access through `mysql2/promise`
 - OpenAI JavaScript SDK configured with the OpenRouter-compatible API
 - `pdf-parse` for PDF text extraction
 - `google-auth-library` for Google ID-token verification
@@ -96,34 +100,44 @@ The frontend currently displays an under-development notice for Google sign-in a
 Guest access is an explicit request mode, not a replacement for the authenticated flow:
 
 - `POST /api/judgment/analyze` accepts `X-Guest-Mode: true` without requiring a JWT.
-- The backend performs PDF extraction and AI analysis, then returns the result without inserting a summary into MySQL or indexing RAG chunks.
-- `POST /api/chat` accepts the same header and answers using the structured analysis supplied in the request.
-- Guest requests do not receive database-backed original-passage retrieval or persistent history.
+- The backend performs PDF extraction and AI analysis without inserting a summary into MySQL.
+- The full extracted PDF text is chunked, embedded, and indexed in Qdrant under a random document ID. The ID is returned as `summaryId` for the current browser session.
+- `POST /api/chat` accepts the same header and uses that document ID to retrieve the top five relevant original passages from Qdrant.
+- Guest chat and analysis remain temporary: no MySQL summary or chat history is persisted. The Qdrant vectors remain until explicitly deleted or the free cluster is removed.
 
 Requests without the guest-mode header continue through JWT verification. Do not treat the guest header as proof of a user identity.
 
 ### 5. Retrieval-Augmented Generation (RAG)
 
-RAG improves document-specific chat by retrieving relevant text from the original judgment rather than relying only on the generated summary.
+SAKSHYA uses Qdrant Cloud as its vector database. This lets Guest Mode use original-document RAG without requiring a MySQL account or saved-summary row.
 
 **Indexing pipeline**
 
-1. The PDF text is split on page boundaries.
-2. Each page is normalized and divided into overlapping text chunks (default: 1,100 characters with 180 characters of overlap).
-3. The embedding client sends batches of up to 32 chunks to an OpenAI-compatible embeddings endpoint.
-4. Each chunk, page number, owner, judgment ID, and JSON-serialized embedding vector is stored in the MySQL `judgment_chunks` table.
+1. The PDF parser extracts text while preserving page boundaries.
+2. Each page is normalized and divided into overlapping chunks (default: 1,100 characters with 180 characters of overlap).
+3. The OpenAI-compatible embeddings endpoint generates vectors in batches of up to 32 chunks.
+4. The backend creates the `sakshya_judgments` Qdrant collection on first use, using the embedding vector dimension and cosine distance.
+5. Each vector is stored with payload metadata: document ID, owner scope, page number, chunk index, and original passage text.
 
 **Retrieval pipeline**
 
-1. A user's question is converted into an embedding.
-2. The backend loads chunks belonging to the requested judgment and authenticated user.
-3. Cosine similarity is calculated between the question vector and stored chunk vectors.
-4. The five highest-scoring passages are added to the chat system prompt.
-5. The assistant is instructed to ground document-specific answers in supplied passages and cite them as `[Page N]`.
+1. The user's question is converted into an embedding.
+2. Qdrant performs cosine-similarity vector search, filtered by both document ID and owner scope.
+3. The five highest-scoring original passages are included in the chat system prompt.
+4. The assistant is instructed to ground document-specific answers in retrieved passages and cite them as `[Page N]`.
 
-The current implementation stores vectors as JSON in MySQL and computes cosine similarity in application code; it does not use a separate vector database.
+**Guest isolation**
 
-If embeddings are unavailable or indexing fails, judgment analysis can still complete and chat can fall back to structured analysis. Guest mode intentionally skips this database-backed RAG pipeline.
+- Each guest PDF receives a cryptographically random document ID.
+- Guest vectors use a document-specific owner scope, and chat searches are filtered to that exact ID/scope pair.
+- The frontend sends the returned document ID as `summaryId` on subsequent chat requests.
+- Guest documents are not written to MySQL. They remain in Qdrant until manually removed or the cluster is deleted; configure a retention/cleanup policy before using this for sensitive production documents.
+
+**Authenticated users**
+
+Authenticated indexing continues to associate Qdrant vectors with the saved MySQL summary ID and the user's email scope. Retrieval first checks that the summary belongs to the authenticated user, then searches Qdrant. This authenticated flow still requires a working MySQL database.
+
+If embeddings or Qdrant are unavailable, analysis can still complete, but the response reports that RAG indexing did not complete and chat falls back to the structured analysis.
 
 ### 6. AI provider integration
 
@@ -164,8 +178,9 @@ Content-Type: application/json
 ### Requirements
 
 - Node.js LTS and npm
-- MySQL server/database
-- OpenRouter API key for AI analysis and chat
+- MySQL server/database for authenticated accounts and history (Guest Mode does not require it)
+- OpenRouter API key for AI analysis, chat, and embeddings
+- Qdrant Cloud cluster and API key for RAG
 
 ### Install
 
@@ -198,7 +213,12 @@ OPENROUTER_API_KEY=your_openrouter_api_key
 GOOGLE_CLIENT_ID=your_google_oauth_client_id
 JWT_SECRET=use_a_long_random_secret
 
-# Optional RAG embedding configuration
+# Qdrant Cloud vector database (required for RAG)
+QDRANT_URL=https://your-cluster-endpoint
+QDRANT_API_KEY=your_qdrant_api_key
+QDRANT_COLLECTION=sakshya_judgments
+
+# Optional embedding overrides (otherwise OPENROUTER_API_KEY is reused)
 RAG_EMBEDDING_API_KEY=your_embeddings_api_key
 RAG_EMBEDDING_BASE_URL=https://openrouter.ai/api/v1
 RAG_EMBEDDING_MODEL=openai/text-embedding-3-small
@@ -206,7 +226,7 @@ RAG_EMBEDDING_MODEL=openai/text-embedding-3-small
 
 `RAG_EMBEDDING_API_KEY` is optional and falls back to `OPENROUTER_API_KEY`. The selected provider and model must support the OpenAI-compatible `/embeddings` endpoint.
 
-Create the MySQL database named in `DB_NAME`. The application expects the account, summary, and chat-history tables used by the authentication and route queries. The RAG service creates `judgment_chunks` automatically when indexing is first attempted; its foreign key references `pdf_summaries(id)`.
+Create the MySQL database named in `DB_NAME`. The application expects the account, summary, and chat-history tables used by the authentication and route queries. RAG vectors are stored in the Qdrant collection configured by `QDRANT_COLLECTION` (default: `sakshya_judgments`). No MySQL vector table is required.
 
 Never commit `.env` or real credentials.
 
@@ -226,7 +246,7 @@ The API listens on the configured `PORT` (5000 by default).
 
 The backend can run on a Node hosting service such as Render. Configure all required environment variables in the hosting dashboard, set `FRONTEND_URL` to the deployed frontend origin, and add that origin to the CORS allowlist in `server.js`. Configure the frontend's `VITE_API_BASE_URL` with the deployed backend origin.
 
-Guest analysis/chat can run without a working MySQL database as long as the backend process starts and the OpenRouter key is valid. Account authentication, saved history, and authenticated RAG indexing/retrieval require a reachable and correctly initialized MySQL database.
+Guest analysis, Qdrant indexing, and guest RAG chat can run without a working MySQL database when the OpenRouter and Qdrant credentials are configured. Google account persistence, saved history, and authenticated RAG ownership checks still require a reachable and correctly initialized MySQL database.
 
 ## Current limitations
 
@@ -235,7 +255,7 @@ Guest analysis/chat can run without a working MySQL database as long as the back
 - Guest chat uses structured analysis only; original-passage RAG is available only for saved, authenticated judgments.
 - PDF text extraction does not currently perform OCR for scanned/image-only documents.
 - Analysis input is capped at 12,000 extracted characters.
-- RAG vectors are stored as JSON in MySQL and compared in application code, which may not scale as well as a dedicated vector store for large collections.
+- Guest documents are temporary at the application/session level but their Qdrant vectors require an explicit cleanup/retention strategy. The free Qdrant cluster can also suspend after inactivity and has limited storage.
 - AI output is generated content and should be reviewed against the original judgment; SAKSHYA is an assistance tool, not a substitute for professional legal judgment.
 
 ## Related repository
