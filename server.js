@@ -16,6 +16,7 @@ app.use(cors({
   origin: [
     "http://localhost:5173",
     "https://sakshya7.vercel.app",
+    "https://sakshya-frontend.vercel.app",
   ],
   methods: ["GET", "POST"],
   credentials: true,
