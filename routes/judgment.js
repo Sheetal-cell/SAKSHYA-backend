@@ -31,7 +31,21 @@ function getClient() {
 }
 
 async function extractTextFromPDF(buffer) {
-  const data = await pdfParse(buffer);
+  // Preserve page boundaries so RAG citations map to actual PDF pages.
+  const data = await pdfParse(buffer, {
+    pagerender: async (pageData) => {
+      const textContent = await pageData.getTextContent({ normalizeWhitespace: true });
+      let lastY = null;
+      let pageText = "";
+      for (const item of textContent.items) {
+        const y = item.transform ? item.transform[5] : null;
+        if (lastY !== null && y !== null && y !== lastY) pageText += "\n";
+        pageText += item.str || "";
+        lastY = y;
+      }
+      return "\f" + pageText;
+    },
+  });
   return data.text;
 }
 

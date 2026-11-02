@@ -48,7 +48,7 @@ function splitJudgmentIntoChunks(fullText, chunkSize = 1100, overlap = 180) {
       const end = Math.min(start + chunkSize, normalized.length);
       const content = normalized.slice(start, end).trim();
       if (content.length >= 40) {
-        chunks.push({ pageNumber: pageIndex + 1, content });
+        chunks.push({ pageNumber: pages.length > 1 ? pageIndex : 1, content });
       }
       if (end >= normalized.length) break;
       start = Math.max(end - overlap, start + 1);
