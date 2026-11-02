@@ -1,10 +1,12 @@
 const OpenAI = require("openai");
+const { randomUUID } = require("crypto");
 const pool = require("../db/connection");
+
+const COLLECTION = process.env.QDRANT_COLLECTION || "sakshya_judgments";
 
 function getEmbeddingClient() {
   const apiKey = process.env.RAG_EMBEDDING_API_KEY || process.env.OPENROUTER_API_KEY;
   if (!apiKey) return null;
-
   return new OpenAI({
     apiKey,
     baseURL: process.env.RAG_EMBEDDING_BASE_URL || "https://openrouter.ai/api/v1",
@@ -17,22 +19,33 @@ function getEmbeddingModel() {
   return process.env.RAG_EMBEDDING_MODEL || "openai/text-embedding-3-small";
 }
 
-async function ensureRagTable() {
-  await pool.query(`
-    CREATE TABLE IF NOT EXISTS judgment_chunks (
-      id BIGINT AUTO_INCREMENT PRIMARY KEY,
-      summary_id INT NOT NULL,
-      user_email VARCHAR(255) NOT NULL,
-      page_number INT NOT NULL,
-      chunk_index INT NOT NULL,
-      content TEXT NOT NULL,
-      embedding_json LONGTEXT NOT NULL,
-      created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-      INDEX idx_chunks_owner_summary (user_email, summary_id),
-      CONSTRAINT fk_judgment_chunks_summary
-        FOREIGN KEY (summary_id) REFERENCES pdf_summaries(id) ON DELETE CASCADE
-    )
-  `);
+function getQdrantConfig() {
+  if (!process.env.QDRANT_URL || !process.env.QDRANT_API_KEY) return null;
+  return {
+    baseUrl: process.env.QDRANT_URL.replace(/\/$/, ""),
+    apiKey: process.env.QDRANT_API_KEY,
+  };
+}
+
+// Use Qdrant's REST API so no additional runtime dependency is required.
+async function qdrantRequest(path, { method = "GET", body } = {}) {
+  const config = getQdrantConfig();
+  if (!config) throw new Error("QDRANT_URL or QDRANT_API_KEY is not configured.");
+
+  const response = await fetch(`${config.baseUrl}${path}`, {
+    method,
+    headers: {
+      "Content-Type": "application/json",
+      "api-key": config.apiKey,
+    },
+    ...(body ? { body: JSON.stringify(body) } : {}),
+  });
+
+  const result = await response.json().catch(() => ({}));
+  if (!response.ok || result.status === "error") {
+    throw new Error(result.status?.error || result.result?.status || `Qdrant request failed (${response.status}).`);
+  }
+  return result;
 }
 
 function splitJudgmentIntoChunks(fullText, chunkSize = 1100, overlap = 180) {
@@ -42,7 +55,6 @@ function splitJudgmentIntoChunks(fullText, chunkSize = 1100, overlap = 180) {
   pages.forEach((pageText, pageIndex) => {
     const normalized = pageText.replace(/[ \t]+/g, " ").replace(/\n{3,}/g, "\n\n").trim();
     if (!normalized) return;
-
     let start = 0;
     while (start < normalized.length) {
       const end = Math.min(start + chunkSize, normalized.length);
@@ -63,126 +75,139 @@ async function createEmbeddings(client, texts) {
     model: getEmbeddingModel(),
     input: texts,
   });
-  return response.data
-    .sort((a, b) => a.index - b.index)
-    .map(item => item.embedding);
+  return response.data.sort((a, b) => a.index - b.index).map(item => item.embedding);
 }
 
-async function indexJudgment({ summaryId, userEmail, fullText }) {
-  const client = getEmbeddingClient();
-  if (!client) {
-    return { indexed: false, reason: "Embedding API key is not configured." };
-  }
+async function ensureCollection(vectorSize) {
+  const collections = await qdrantRequest("/collections");
+  const exists = collections.result?.collections?.some(item => item.name === COLLECTION);
+  if (exists) return;
 
-  await ensureRagTable();
+  try {
+    await qdrantRequest(`/collections/${encodeURIComponent(COLLECTION)}`, {
+      method: "PUT",
+      body: { vectors: { size: vectorSize, distance: "Cosine" } },
+    });
+  } catch (error) {
+    // A concurrent upload may create the collection between list and create.
+    const refreshed = await qdrantRequest("/collections");
+    if (!refreshed.result?.collections?.some(item => item.name === COLLECTION)) throw error;
+  }
+}
+
+async function indexJudgment({ summaryId, userEmail, fullText, isGuest = false }) {
+  const embeddingClient = getEmbeddingClient();
+  if (!embeddingClient) return { indexed: false, reason: "Embedding API key is not configured." };
+  if (!getQdrantConfig()) return { indexed: false, reason: "QDRANT_URL or QDRANT_API_KEY is not configured." };
+
   const chunks = splitJudgmentIntoChunks(fullText);
-  if (!chunks.length) {
-    return { indexed: false, reason: "No readable judgment passages were extracted." };
-  }
+  if (!chunks.length) return { indexed: false, reason: "No readable judgment passages were extracted." };
 
-  // Generate vectors in small batches to avoid oversized provider requests.
-  const batchSize = 32;
-  const rows = [];
-  for (let i = 0; i < chunks.length; i += batchSize) {
-    const batch = chunks.slice(i, i + batchSize);
-    const vectors = await createEmbeddings(client, batch.map(item => item.content));
+  // Guest documents receive an unguessable ID and never require a MySQL row.
+  const documentId = isGuest ? randomUUID() : String(summaryId);
+  const ownerKey = isGuest ? `guest:${documentId}` : `user:${String(userEmail).toLowerCase()}`;
+  const points = [];
+
+  for (let i = 0; i < chunks.length; i += 32) {
+    const batch = chunks.slice(i, i + 32);
+    const vectors = await createEmbeddings(embeddingClient, batch.map(item => item.content));
     batch.forEach((chunk, index) => {
-      rows.push([
-        summaryId,
-        userEmail,
-        chunk.pageNumber,
-        chunk.chunkIndex,
-        chunk.content,
-        JSON.stringify(vectors[index]),
-      ]);
+      points.push({
+        id: randomUUID(),
+        vector: vectors[index],
+        payload: {
+          documentId,
+          ownerKey,
+          pageNumber: chunk.pageNumber,
+          chunkIndex: chunk.chunkIndex,
+          content: chunk.content,
+        },
+      });
     });
   }
 
-  const conn = await pool.getConnection();
-  try {
-    await conn.beginTransaction();
-    await conn.query(
-      "DELETE FROM judgment_chunks WHERE summary_id = ? AND user_email = ?",
+  await ensureCollection(points[0].vector.length);
+
+  // Replace previous vectors if an authenticated judgment is re-indexed.
+  if (!isGuest) {
+    await qdrantRequest(`/collections/${encodeURIComponent(COLLECTION)}/points/delete?wait=true`, {
+      method: "POST",
+      body: {
+        filter: {
+          must: [
+            { key: "documentId", match: { value: documentId } },
+            { key: "ownerKey", match: { value: ownerKey } },
+          ],
+        },
+      },
+    });
+  }
+
+  for (let i = 0; i < points.length; i += 100) {
+    await qdrantRequest(`/collections/${encodeURIComponent(COLLECTION)}/points?wait=true`, {
+      method: "PUT",
+      body: { points: points.slice(i, i + 100) },
+    });
+  }
+
+  return { indexed: true, chunkCount: points.length, documentId };
+}
+
+async function retrieveRelevantChunks({
+  summaryId,
+  documentId,
+  userEmail,
+  question,
+  limit = 5,
+  isGuest = false,
+}) {
+  const embeddingClient = getEmbeddingClient();
+  if (!embeddingClient || !getQdrantConfig()) return [];
+
+  let targetDocumentId;
+  let ownerKey;
+
+  if (isGuest) {
+    targetDocumentId = String(documentId || summaryId || "");
+    if (!targetDocumentId) return [];
+    ownerKey = `guest:${targetDocumentId}`;
+  } else {
+    if (!summaryId || !userEmail) return [];
+    const [ownedSummary] = await pool.query(
+      "SELECT id FROM pdf_summaries WHERE id = ? AND user_email = ? LIMIT 1",
       [summaryId, userEmail]
     );
-    for (let i = 0; i < rows.length; i += 100) {
-      const batch = rows.slice(i, i + 100);
-      await conn.query(
-        `INSERT INTO judgment_chunks
-          (summary_id, user_email, page_number, chunk_index, content, embedding_json)
-         VALUES ?`,
-        [batch]
-      );
+    if (!ownedSummary.length) {
+      const error = new Error("Judgment not found for this account.");
+      error.status = 404;
+      throw error;
     }
-    await conn.commit();
-  } catch (error) {
-    await conn.rollback();
-    throw error;
-  } finally {
-    conn.release();
+    targetDocumentId = String(summaryId);
+    ownerKey = `user:${String(userEmail).toLowerCase()}`;
   }
 
-  return { indexed: true, chunkCount: rows.length };
+  const [queryVector] = await createEmbeddings(embeddingClient, [question]);
+  const result = await qdrantRequest(`/collections/${encodeURIComponent(COLLECTION)}/points/search`, {
+    method: "POST",
+    body: {
+      vector: queryVector,
+      limit,
+      with_payload: true,
+      filter: {
+        must: [
+          { key: "documentId", match: { value: targetDocumentId } },
+          { key: "ownerKey", match: { value: ownerKey } },
+        ],
+      },
+    },
+  });
+
+  return (result.result || []).map(point => ({
+    pageNumber: point.payload.pageNumber,
+    chunkIndex: point.payload.chunkIndex,
+    content: point.payload.content,
+    score: point.score,
+  }));
 }
 
-function cosineSimilarity(a, b) {
-  if (!Array.isArray(a) || !Array.isArray(b) || a.length !== b.length) return -1;
-  let dot = 0;
-  let normA = 0;
-  let normB = 0;
-  for (let i = 0; i < a.length; i++) {
-    dot += a[i] * b[i];
-    normA += a[i] * a[i];
-    normB += b[i] * b[i];
-  }
-  if (!normA || !normB) return -1;
-  return dot / (Math.sqrt(normA) * Math.sqrt(normB));
-}
-
-async function retrieveRelevantChunks({ summaryId, userEmail, question, limit = 5 }) {
-  const client = getEmbeddingClient();
-  if (!client) return [];
-
-  await ensureRagTable();
-  const [ownedSummary] = await pool.query(
-    "SELECT id FROM pdf_summaries WHERE id = ? AND user_email = ? LIMIT 1",
-    [summaryId, userEmail]
-  );
-  if (!ownedSummary.length) {
-    const error = new Error("Judgment not found for this account.");
-    error.status = 404;
-    throw error;
-  }
-
-  const [rows] = await pool.query(
-    `SELECT page_number, chunk_index, content, embedding_json
-     FROM judgment_chunks
-     WHERE summary_id = ? AND user_email = ?
-     ORDER BY chunk_index ASC`,
-    [summaryId, userEmail]
-  );
-  if (!rows.length) return [];
-
-  const [queryVector] = await createEmbeddings(client, [question]);
-  return rows
-    .map(row => {
-      let vector;
-      try { vector = JSON.parse(row.embedding_json); } catch { vector = []; }
-      return {
-        pageNumber: row.page_number,
-        chunkIndex: row.chunk_index,
-        content: row.content,
-        score: cosineSimilarity(queryVector, vector),
-      };
-    })
-    .filter(item => item.score >= 0)
-    .sort((a, b) => b.score - a.score)
-    .slice(0, limit);
-}
-
-module.exports = {
-  ensureRagTable,
-  indexJudgment,
-  retrieveRelevantChunks,
-  splitJudgmentIntoChunks,
-};
+module.exports = { indexJudgment, retrieveRelevantChunks, splitJudgmentIntoChunks };

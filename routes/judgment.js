@@ -206,13 +206,22 @@ ${trimmedText}
       parsed.negotiationCheatSheet = [];
     }
 
-    // Guest analysis is intentionally stateless while the database is unavailable.
+    // Guest analysis remains account-free, but its original PDF passages are
+    // indexed in Qdrant under a random document ID so chat can use real RAG.
     if (req.isGuest) {
+      let rag = { indexed: false, reason: "Guest document indexing was not completed." };
+      try {
+        rag = await indexJudgment({ fullText: text, isGuest: true });
+      } catch (ragError) {
+        console.error("⚠️ Guest RAG indexing failed:", ragError.message);
+        rag = { indexed: false, reason: "Analysis completed, but passage indexing failed." };
+      }
+
       return res.json({
         success: true,
-        summaryId: null,
+        summaryId: rag.documentId || null,
         data: parsed,
-        rag: { indexed: false, reason: "Guest mode: analysis is temporary and is not saved." },
+        rag,
         guest: true,
       });
     }
