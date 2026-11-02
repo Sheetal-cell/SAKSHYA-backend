@@ -100,7 +100,7 @@ ${trimmedText}
 }
 
 // ─────────────────────────────────────────────────────────────────────────────
-router.post("/analyze", verifyJWT, async (req, res) => {
+router.post("/analyze", (req, res, next) => req.headers["x-guest-mode"] === "true" ? (req.isGuest = true, next()) : verifyJWT(req, res, next), async (req, res) => {
   const { base64, filename } = req.body;
 
   if (!base64) return res.status(400).json({ error: "No PDF data provided." });
@@ -204,6 +204,17 @@ ${trimmedText}
     } catch (csErr) {
       console.warn("⚠️ Cheat sheet pass failed, using empty array:", csErr.message);
       parsed.negotiationCheatSheet = [];
+    }
+
+    // Guest analysis is intentionally stateless while the database is unavailable.
+    if (req.isGuest) {
+      return res.json({
+        success: true,
+        summaryId: null,
+        data: parsed,
+        rag: { indexed: false, reason: "Guest mode: analysis is temporary and is not saved." },
+        guest: true,
+      });
     }
 
     // ── Save to DB ────────────────────────────────────────────────────────────
