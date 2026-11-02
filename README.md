@@ -111,6 +111,15 @@ Requests without the guest-mode header continue through JWT verification. Do not
 
 SAKSHYA uses Qdrant Cloud as its vector database. This lets Guest Mode use original-document RAG without requiring a MySQL account or saved-summary row.
 
+**Qdrant Cloud deployment used by this project**
+
+- Provider: Qdrant Cloud (managed vector database).
+- Cluster plan: Free tier.
+- Cloud provider and region: AWS, London (`eu-west-2`).
+- Collection: `sakshya_judgments` (created automatically by the backend when needed).
+- The backend connects using `QDRANT_URL` and `QDRANT_API_KEY`; keep the API key private and configure it as a backend environment variable (for example, in Render), never in the frontend or Git.
+- Qdrant Cloud free clusters may be suspended after a period of inactivity. Check the Qdrant Cloud dashboard and reactivate the cluster if it is suspended before testing indexing or retrieval.
+
 **Indexing pipeline**
 
 1. The PDF parser extracts text while preserving page boundaries.
@@ -252,7 +261,6 @@ Guest analysis, Qdrant indexing, and guest RAG chat can run without a working My
 
 - The database layer is MySQL-specific (`mysql2`); PostgreSQL is not a drop-in replacement without changing the connection and SQL implementation.
 - Guest sessions are stateless and do not save PDF analyses or chat history.
-- Guest chat uses structured analysis only; original-passage RAG is available only for saved, authenticated judgments.
 - PDF text extraction does not currently perform OCR for scanned/image-only documents.
 - Analysis input is capped at 12,000 extracted characters.
 - Guest documents are temporary at the application/session level but their Qdrant vectors require an explicit cleanup/retention strategy. The free Qdrant cluster can also suspend after inactivity and has limited storage.
