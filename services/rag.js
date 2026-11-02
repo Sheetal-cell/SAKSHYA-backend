@@ -1,5 +1,4 @@
 const OpenAI = require("openai");
-const { QdrantClient } = require("@qdrant/js-client-rest");
 const { randomUUID } = require("crypto");
 const pool = require("../db/connection");
 
@@ -8,7 +7,6 @@ const COLLECTION = process.env.QDRANT_COLLECTION || "sakshya_judgments";
 function getEmbeddingClient() {
   const apiKey = process.env.RAG_EMBEDDING_API_KEY || process.env.OPENROUTER_API_KEY;
   if (!apiKey) return null;
-
   return new OpenAI({
     apiKey,
     baseURL: process.env.RAG_EMBEDDING_BASE_URL || "https://openrouter.ai/api/v1",
@@ -21,13 +19,33 @@ function getEmbeddingModel() {
   return process.env.RAG_EMBEDDING_MODEL || "openai/text-embedding-3-small";
 }
 
-function getQdrantClient() {
+function getQdrantConfig() {
   if (!process.env.QDRANT_URL || !process.env.QDRANT_API_KEY) return null;
-  return new QdrantClient({
-    url: process.env.QDRANT_URL,
+  return {
+    baseUrl: process.env.QDRANT_URL.replace(/\/$/, ""),
     apiKey: process.env.QDRANT_API_KEY,
-    timeout: 60000,
+  };
+}
+
+// Use Qdrant's REST API so no additional runtime dependency is required.
+async function qdrantRequest(path, { method = "GET", body } = {}) {
+  const config = getQdrantConfig();
+  if (!config) throw new Error("QDRANT_URL or QDRANT_API_KEY is not configured.");
+
+  const response = await fetch(`${config.baseUrl}${path}`, {
+    method,
+    headers: {
+      "Content-Type": "application/json",
+      "api-key": config.apiKey,
+    },
+    ...(body ? { body: JSON.stringify(body) } : {}),
   });
+
+  const result = await response.json().catch(() => ({}));
+  if (!response.ok || result.status === "error") {
+    throw new Error(result.status?.error || result.result?.status || `Qdrant request failed (${response.status}).`);
+  }
+  return result;
 }
 
 function splitJudgmentIntoChunks(fullText, chunkSize = 1100, overlap = 180) {
@@ -37,7 +55,6 @@ function splitJudgmentIntoChunks(fullText, chunkSize = 1100, overlap = 180) {
   pages.forEach((pageText, pageIndex) => {
     const normalized = pageText.replace(/[ \t]+/g, " ").replace(/\n{3,}/g, "\n\n").trim();
     if (!normalized) return;
-
     let start = 0;
     while (start < normalized.length) {
       const end = Math.min(start + chunkSize, normalized.length);
@@ -58,53 +75,41 @@ async function createEmbeddings(client, texts) {
     model: getEmbeddingModel(),
     input: texts,
   });
-  return response.data
-    .sort((a, b) => a.index - b.index)
-    .map(item => item.embedding);
+  return response.data.sort((a, b) => a.index - b.index).map(item => item.embedding);
 }
 
-async function ensureCollection(qdrant, vectorSize) {
-  const collections = await qdrant.getCollections();
-  const exists = collections.collections.some(item => item.name === COLLECTION);
+async function ensureCollection(vectorSize) {
+  const collections = await qdrantRequest("/collections");
+  const exists = collections.result?.collections?.some(item => item.name === COLLECTION);
+  if (exists) return;
 
-  if (!exists) {
-    try {
-      await qdrant.createCollection(COLLECTION, {
-        vectors: { size: vectorSize, distance: "Cosine" },
-      });
-    } catch (error) {
-      // Another simultaneous upload may have created the collection first.
-      const refreshed = await qdrant.getCollections();
-      if (!refreshed.collections.some(item => item.name === COLLECTION)) throw error;
-    }
+  try {
+    await qdrantRequest(`/collections/${encodeURIComponent(COLLECTION)}`, {
+      method: "PUT",
+      body: { vectors: { size: vectorSize, distance: "Cosine" } },
+    });
+  } catch (error) {
+    // A concurrent upload may create the collection between list and create.
+    const refreshed = await qdrantRequest("/collections");
+    if (!refreshed.result?.collections?.some(item => item.name === COLLECTION)) throw error;
   }
 }
 
 async function indexJudgment({ summaryId, userEmail, fullText, isGuest = false }) {
   const embeddingClient = getEmbeddingClient();
-  const qdrant = getQdrantClient();
-
-  if (!embeddingClient) {
-    return { indexed: false, reason: "Embedding API key is not configured." };
-  }
-  if (!qdrant) {
-    return { indexed: false, reason: "QDRANT_URL or QDRANT_API_KEY is not configured." };
-  }
+  if (!embeddingClient) return { indexed: false, reason: "Embedding API key is not configured." };
+  if (!getQdrantConfig()) return { indexed: false, reason: "QDRANT_URL or QDRANT_API_KEY is not configured." };
 
   const chunks = splitJudgmentIntoChunks(fullText);
-  if (!chunks.length) {
-    return { indexed: false, reason: "No readable judgment passages were extracted." };
-  }
+  if (!chunks.length) return { indexed: false, reason: "No readable judgment passages were extracted." };
 
   // Guest documents receive an unguessable ID and never require a MySQL row.
   const documentId = isGuest ? randomUUID() : String(summaryId);
   const ownerKey = isGuest ? `guest:${documentId}` : `user:${String(userEmail).toLowerCase()}`;
-
-  // Generate vectors in small batches to avoid oversized provider requests.
-  const batchSize = 32;
   const points = [];
-  for (let i = 0; i < chunks.length; i += batchSize) {
-    const batch = chunks.slice(i, i + batchSize);
+
+  for (let i = 0; i < chunks.length; i += 32) {
+    const batch = chunks.slice(i, i + 32);
     const vectors = await createEmbeddings(embeddingClient, batch.map(item => item.content));
     batch.forEach((chunk, index) => {
       points.push({
@@ -121,23 +126,27 @@ async function indexJudgment({ summaryId, userEmail, fullText, isGuest = false }
     });
   }
 
-  await ensureCollection(qdrant, points[0].vector.length);
+  await ensureCollection(points[0].vector.length);
 
-  // Re-indexing an authenticated summary replaces its previous vectors.
+  // Replace previous vectors if an authenticated judgment is re-indexed.
   if (!isGuest) {
-    await qdrant.delete(COLLECTION, {
-      wait: true,
-      filter: { must: [
-        { key: "documentId", match: { value: documentId } },
-        { key: "ownerKey", match: { value: ownerKey } },
-      ] },
+    await qdrantRequest(`/collections/${encodeURIComponent(COLLECTION)}/points/delete?wait=true`, {
+      method: "POST",
+      body: {
+        filter: {
+          must: [
+            { key: "documentId", match: { value: documentId } },
+            { key: "ownerKey", match: { value: ownerKey } },
+          ],
+        },
+      },
     });
   }
 
   for (let i = 0; i < points.length; i += 100) {
-    await qdrant.upsert(COLLECTION, {
-      wait: true,
-      points: points.slice(i, i + 100),
+    await qdrantRequest(`/collections/${encodeURIComponent(COLLECTION)}/points?wait=true`, {
+      method: "PUT",
+      body: { points: points.slice(i, i + 100) },
     });
   }
 
@@ -153,8 +162,7 @@ async function retrieveRelevantChunks({
   isGuest = false,
 }) {
   const embeddingClient = getEmbeddingClient();
-  const qdrant = getQdrantClient();
-  if (!embeddingClient || !qdrant) return [];
+  if (!embeddingClient || !getQdrantConfig()) return [];
 
   let targetDocumentId;
   let ownerKey;
@@ -179,19 +187,22 @@ async function retrieveRelevantChunks({
   }
 
   const [queryVector] = await createEmbeddings(embeddingClient, [question]);
-  const result = await qdrant.search(COLLECTION, {
-    vector: queryVector,
-    limit,
-    with_payload: true,
-    filter: {
-      must: [
-        { key: "documentId", match: { value: targetDocumentId } },
-        { key: "ownerKey", match: { value: ownerKey } },
-      ],
+  const result = await qdrantRequest(`/collections/${encodeURIComponent(COLLECTION)}/points/search`, {
+    method: "POST",
+    body: {
+      vector: queryVector,
+      limit,
+      with_payload: true,
+      filter: {
+        must: [
+          { key: "documentId", match: { value: targetDocumentId } },
+          { key: "ownerKey", match: { value: ownerKey } },
+        ],
+      },
     },
   });
 
-  return result.map(point => ({
+  return (result.result || []).map(point => ({
     pageNumber: point.payload.pageNumber,
     chunkIndex: point.payload.chunkIndex,
     content: point.payload.content,
@@ -199,8 +210,4 @@ async function retrieveRelevantChunks({
   }));
 }
 
-module.exports = {
-  indexJudgment,
-  retrieveRelevantChunks,
-  splitJudgmentIntoChunks,
-};
+module.exports = { indexJudgment, retrieveRelevantChunks, splitJudgmentIntoChunks };
