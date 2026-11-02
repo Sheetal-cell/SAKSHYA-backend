@@ -39,7 +39,11 @@ async function extractTextFromPDF(buffer) {
       let pageText = "";
       for (const item of textContent.items) {
         const y = item.transform ? item.transform[5] : null;
-        if (lastY !== null && y !== null && y !== lastY) pageText += "\n";
+        if (lastY !== null && y !== null && y !== lastY) {
+          pageText += "\n";
+        } else if (pageText && !pageText.endsWith("\n")) {
+          pageText += " ";
+        }
         pageText += item.str || "";
         lastY = y;
       }
