@@ -83,7 +83,7 @@ async function callWithRetry(fn, retries = 3, delayMs = 1000) {
 }
 
 // ─── POST /api/chat ───────────────────────────────────────────────────────────
-router.post("/", verifyJWT, async (req, res) => {
+router.post("/", (req, res, next) => req.headers["x-guest-mode"] === "true" ? (req.isGuest = true, next()) : verifyJWT(req, res, next), async (req, res) => {
   const { context, history = [], message, summaryId } = req.body;
 
   if (!message || typeof message !== "string") {
@@ -98,7 +98,7 @@ router.post("/", verifyJWT, async (req, res) => {
 
   // Retrieve the most relevant source passages for this user's judgment.
   let retrievedChunks = [];
-  if (summaryId) {
+  if (summaryId && !req.isGuest) {
     try {
       retrievedChunks = await retrieveRelevantChunks({
         summaryId,
