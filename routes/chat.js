@@ -98,13 +98,15 @@ router.post("/", (req, res, next) => req.headers["x-guest-mode"] === "true" ? (r
 
   // Retrieve the most relevant source passages for this user's judgment.
   let retrievedChunks = [];
-  if (summaryId && !req.isGuest) {
+  if (summaryId) {
     try {
       retrievedChunks = await retrieveRelevantChunks({
         summaryId,
-        userEmail: req.user.email,
+        documentId: summaryId,
+        userEmail: req.isGuest ? undefined : req.user.email,
         question: message,
         limit: 5,
+        isGuest: !!req.isGuest,
       });
     } catch (ragError) {
       if (ragError.status === 404) {
@@ -157,7 +159,7 @@ router.post("/", (req, res, next) => req.headers["x-guest-mode"] === "true" ? (r
   }
 
   // ── Persist to DB (non-fatal) ────────────────────────────────────────────────
-  if (summaryId) {
+  if (summaryId && !req.isGuest) {
     try {
       await pool.query(
         `INSERT INTO chat_history (user_email, summary_id, role, content) VALUES
