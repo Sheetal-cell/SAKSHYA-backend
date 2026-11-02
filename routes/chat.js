@@ -2,6 +2,7 @@ const express = require("express");
 const OpenAI  = require("openai");
 const pool    = require("../db/connection");
 const verifyJWT = require("../middleware/authMiddleware");
+const { retrieveRelevantChunks } = require("../services/rag");
 
 const router = express.Router();
 
@@ -20,7 +21,7 @@ function getClient() {
 }
 
 // ─── System prompt ────────────────────────────────────────────────────────────
-function buildSystemPrompt(context) {
+function buildSystemPrompt(context, retrievedChunks = []) {
   if (context && context.isGeneralLegalQuery) {
     return `You are SAKSHYA Assistant — an expert legal AI built for the Court Case Monitoring System (CCMS) of the Centre for e-Governance, India.
 
@@ -32,16 +33,27 @@ Do NOT use **markdown bold** in your responses. Use plain text only.`;
   }
 
   const safeContext = JSON.stringify(context).slice(0, 6000);
+  const passageContext = retrievedChunks.length
+    ? retrievedChunks.map((item, index) =>
+        `[P${item.pageNumber} | passage ${index + 1}]\n${item.content}`
+      ).join("\n\n")
+    : "No original judgment passages were retrieved for this question.";
   return `You are SAKSHYA Assistant — an expert legal AI built for the Court Case Monitoring System (CCMS) of the Centre for e-Governance, India.
 
-You have been given the full structured analysis of a court judgment. Answer all follow-up questions using ONLY this data. Be concise, factual and professional. Format lists with bullet points where helpful.
+You may receive both structured judgment analysis and retrieved passages from the original judgment. Use the supplied source material only. Be concise, factual and professional. Format lists with bullet points where helpful.
 
 === JUDGMENT ANALYSIS ===
 ${safeContext}
 ========================
 
+=== RETRIEVED ORIGINAL JUDGMENT PASSAGES ===
+${passageContext}
+===========================================
+
 Rules:
-- Never invent facts not present in the analysis above.
+- Prefer retrieved original judgment passages for document-specific answers; use the structured analysis only as a fallback when no passages were retrieved.
+- Cite supporting passages as [Page N]. Never invent page numbers or facts. If page evidence is unavailable, say so.
+- Never invent facts not present in the supplied material.
 - If the user asks something outside the document, say "This information is not available in the analyzed judgment."
 - When referencing deadlines or compliance items, always emphasise urgency if applicable.
 - Keep answers short (3–6 sentences max) unless a detailed breakdown is explicitly asked.
@@ -84,13 +96,31 @@ router.post("/", verifyJWT, async (req, res) => {
     return res.status(500).json({ error: "OPENROUTER_API_KEY not configured on server." });
   }
 
+  // Retrieve the most relevant source passages for this user's judgment.
+  let retrievedChunks = [];
+  if (summaryId) {
+    try {
+      retrievedChunks = await retrieveRelevantChunks({
+        summaryId,
+        userEmail: req.user.email,
+        question: message,
+        limit: 5,
+      });
+    } catch (ragError) {
+      if (ragError.status === 404) {
+        return res.status(404).json({ error: ragError.message });
+      }
+      console.error("[chat] RAG retrieval failed; using structured analysis:", ragError.message);
+    }
+  }
+
   // ── AI call ─────────────────────────────────────────────────────────────────
   let reply;
   try {
     const client = getClient();
 
     const messages = [
-      { role: "system", content: buildSystemPrompt(context) },
+      { role: "system", content: buildSystemPrompt(context, retrievedChunks) },
       ...history.slice(-10).map(({ role, content }) => ({ role, content })),
       { role: "user", content: message },
     ];
@@ -140,7 +170,7 @@ router.post("/", verifyJWT, async (req, res) => {
     }
   }
 
-  return res.json({ success: true, reply });
+  return res.json({ success: true, reply, citations: retrievedChunks.map(item => ({ page: item.pageNumber, score: Number(item.score.toFixed(3)) })) });
 });
 
 // ─── GET /api/chat/history/:summaryId ────────────────────────────────────────
